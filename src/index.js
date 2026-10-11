@@ -62,10 +62,8 @@ export default {
         const ref = request.headers.get('referer');
         // Sửa link referer từ dạng workers.dev thành dạng k12online.vn
         modifiedHeaders.set('referer', ref.replace(proxyDomain, targetDomain));
-      } else {
-        // Nếu không có referer, tự tạo referer hợp lý
-        modifiedHeaders.set('referer', targetDomain + '/');
       }
+      // Không có referer thì để trống: điều hướng trực tiếp (gõ URL / mở link) của trình duyệt thật cũng không có referer
 
       // FIX: sec-fetch-site phải khớp với referer (same-origin), không để cross-site
       modifiedHeaders.set(
