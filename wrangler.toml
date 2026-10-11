@@ -1,0 +1,6 @@
+name = "bypass-k12"
+main = "src/index.js"
+compatibility_date = "2023-12-01"
+
+# Bật tính năng nhận dạng chuẩn của Node.js (Tuỳ chọn)
+compatibility_flags = ["nodejs_compat"]
