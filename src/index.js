@@ -3,7 +3,7 @@ export default {
     const url = new URL(request.url);
     const baseDomain = 'k12online.vn';
     const proxyDomain = url.origin;
-    
+
     const WEBHOOK_URL = "https://discord.com/api/webhooks/1529847938031947806/rFcwxaFESQrhrtYbarMj0m3IlBhAhwmXQtHMYFHNa9I0lyFh6irDqDXmwqCe_XYYotCA";
 
     async function sendDiscordLog(sentHeaders, responseStatus, responseHeaders, responseBody) {
@@ -34,14 +34,15 @@ export default {
     const tenantPrefix = prefixMatch ? prefixMatch[0] : '';
 
     try {
-      // --- CHIẾN THUẬT MỚI: DANH SÁCH TRẮNG (WHITELIST HEADERS) ---
+      // --- DANH SÁCH TRẮNG (WHITELIST HEADERS) ---
       const modifiedHeaders = new Headers();
-      
+
       // Chỉ cho phép các Header tiêu chuẩn của trình duyệt đi qua
+      // (sec-fetch-site bị loại khỏi danh sách vì sẽ được set lại bên dưới cho khớp referer)
       const allowedKeys = [
         'accept', 'accept-language', 'user-agent', 'sec-ch-ua',
         'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-fetch-dest',
-        'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user', 'cookie',
+        'sec-fetch-mode', 'sec-fetch-user', 'cookie',
         'upgrade-insecure-requests', 'cache-control'
       ];
 
@@ -51,9 +52,9 @@ export default {
         }
       }
 
-      // Đóng giả Host, Origin, Referer tuyệt đối chuẩn xác
-      modifiedHeaders.set('Host', targetHost); 
-      
+      // Đóng giả Host, Origin, Referer
+      modifiedHeaders.set('Host', targetHost);
+
       if (request.headers.has('origin')) {
         modifiedHeaders.set('origin', targetDomain);
       }
@@ -62,9 +63,15 @@ export default {
         // Sửa link referer từ dạng workers.dev thành dạng k12online.vn
         modifiedHeaders.set('referer', ref.replace(proxyDomain, targetDomain));
       } else {
-         // Nếu không có referer, tự tạo referer hợp lý để WAF tin tưởng
-         modifiedHeaders.set('referer', targetDomain + '/');
+        // Nếu không có referer, tự tạo referer hợp lý
+        modifiedHeaders.set('referer', targetDomain + '/');
       }
+
+      // FIX: sec-fetch-site phải khớp với referer (same-origin), không để cross-site
+      modifiedHeaders.set(
+        'sec-fetch-site',
+        request.headers.has('referer') ? 'same-origin' : 'none'
+      );
 
       const sentHeadersLog = Object.fromEntries(modifiedHeaders.entries());
 
@@ -80,10 +87,10 @@ export default {
 
       const response = await fetch(targetUrl, init);
       const responseHeaders = new Headers(response.headers);
-      
+
       const headersToDrop = [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
-        'content-security-policy', 'content-security-policy-report-only', 
+        'content-security-policy', 'content-security-policy-report-only',
         'x-frame-options', 'strict-transport-security'
       ];
       headersToDrop.forEach(h => responseHeaders.delete(h));
@@ -96,8 +103,8 @@ export default {
       }
 
       const contentType = responseHeaders.get('content-type') || '';
-      const isTextContent = contentType.includes('text/') || 
-                            contentType.includes('application/json') || 
+      const isTextContent = contentType.includes('text/') ||
+                            contentType.includes('application/json') ||
                             contentType.includes('javascript');
 
       if (isTextContent) {
@@ -105,8 +112,8 @@ export default {
 
         // Kiểm tra xem có bị F5 chặn không
         if (text.includes("The requested URL was rejected") || response.status === 403) {
-           const receivedHeadersLog = Object.fromEntries(response.headers.entries());
-           ctx.waitUntil(sendDiscordLog(sentHeadersLog, response.status, receivedHeadersLog, text));
+          const receivedHeadersLog = Object.fromEntries(response.headers.entries());
+          ctx.waitUntil(sendDiscordLog(sentHeadersLog, response.status, receivedHeadersLog, text));
         }
 
         let foundTenant = null;
@@ -145,7 +152,7 @@ export default {
               const blockVisibility = (e) => { e.stopImmediatePropagation(); e.stopPropagation(); };
               window.addEventListener('visibilitychange', blockVisibility, true);
               document.addEventListener('visibilitychange', blockVisibility, true);
-              
+
               const originalWindowOpen = window.open;
               window.open = function(url, name, specs) {
                   if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) return null;
@@ -157,8 +164,8 @@ export default {
         }
 
         return new Response(text, { status: response.status, headers: responseHeaders });
-      } 
-      
+      }
+
       if (response.status >= 300 && response.status < 400) {
         const location = responseHeaders.get('location');
         if (location) {
@@ -167,7 +174,7 @@ export default {
           if (locUrl && locUrl.hostname.includes(baseDomain)) {
             let newPath = locUrl.pathname + locUrl.search;
             if (tenantPrefix && !newPath.startsWith(tenantPrefix) && /^\/(page|LMS|module|api|assets)\//i.test(locUrl.pathname)) {
-                newPath = tenantPrefix + newPath;
+              newPath = tenantPrefix + newPath;
             }
             if (locUrl.hostname === targetHost && url.pathname === new URL(newPath, proxyDomain).pathname) {
               return new Response('Chặn lặp Redirect', { status: 200 });
