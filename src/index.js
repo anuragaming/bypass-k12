@@ -23,6 +23,7 @@ export default {
       } catch (err) {}
     }
 
+    // 1. Kiểm tra Cookie tenant
     let targetHost = baseDomain;
     const cookieHeader = request.headers.get('Cookie') || '';
     const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -30,113 +31,141 @@ export default {
 
     const targetDomain = 'https://' + targetHost;
     const targetUrl = targetDomain + url.pathname + url.search;
+
     const prefixMatch = url.pathname.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
     const tenantPrefix = prefixMatch ? prefixMatch[0] : '';
 
     try {
-      // --- DANH SÁCH TRẮNG (WHITELIST HEADERS) ---
-      const modifiedHeaders = new Headers();
+      // --- Giống bản Vercel: forward TOÀN BỘ header, chỉ xóa mấy cái lộ proxy ---
+      const headers = new Headers(request.headers);
 
-      // Chỉ cho phép các Header tiêu chuẩn của trình duyệt đi qua
-      // (sec-fetch-site bị loại khỏi danh sách vì sẽ được set lại bên dưới cho khớp referer)
-      const allowedKeys = [
-        'accept', 'accept-language', 'user-agent', 'sec-ch-ua',
-        'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-fetch-dest',
-        'sec-fetch-mode', 'sec-fetch-user', 'cookie',
-        'upgrade-insecure-requests', 'cache-control'
-      ];
+      [
+        'host', 'referer', 'accept-encoding',
+        'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip',
+        // header do Cloudflare thêm vào request đến Worker
+        'cf-connecting-ip', 'cf-connecting-ipv6', 'cf-ipcountry', 'cf-ray',
+        'cf-visitor', 'cf-worker', 'cf-ew-via', 'cf-pseudo-ipv4', 'cdn-loop',
+        'true-client-ip', 'x-forwarded-port'
+      ].forEach(h => headers.delete(h));
 
-      for (const [key, value] of request.headers.entries()) {
-        if (allowedKeys.includes(key.toLowerCase())) {
-          modifiedHeaders.set(key, value);
-        }
-      }
+      if (headers.has('origin')) headers.set('origin', targetDomain);
 
-      // Đóng giả Host, Origin, Referer
-      modifiedHeaders.set('Host', targetHost);
-
-      if (request.headers.has('origin')) {
-        modifiedHeaders.set('origin', targetDomain);
-      }
-      if (request.headers.has('referer')) {
-        const ref = request.headers.get('referer');
-        // Sửa link referer từ dạng workers.dev thành dạng k12online.vn
-        modifiedHeaders.set('referer', ref.replace(proxyDomain, targetDomain));
-      }
-      // Không có referer thì để trống: điều hướng trực tiếp (gõ URL / mở link) của trình duyệt thật cũng không có referer
-
-      // FIX: sec-fetch-site phải khớp với referer (same-origin), không để cross-site
-      modifiedHeaders.set(
-        'sec-fetch-site',
-        request.headers.has('referer') ? 'same-origin' : 'none'
-      );
-
-      const sentHeadersLog = Object.fromEntries(modifiedHeaders.entries());
+      const sentHeadersLog = Object.fromEntries(headers.entries());
 
       const init = {
         method: request.method,
-        headers: modifiedHeaders,
+        headers: headers,
         redirect: 'manual'
       };
-
       if (!['GET', 'HEAD'].includes(request.method)) {
         init.body = request.body;
       }
 
       const response = await fetch(targetUrl, init);
-      const responseHeaders = new Headers(response.headers);
 
       const headersToDrop = [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
         'content-security-policy', 'content-security-policy-report-only',
         'x-frame-options', 'strict-transport-security'
       ];
-      headersToDrop.forEach(h => responseHeaders.delete(h));
+
+      const responseHeaders = new Headers();
+      response.headers.forEach((value, key) => {
+        const k = key.toLowerCase();
+        if (!headersToDrop.includes(k) && k !== 'set-cookie') {
+          responseHeaders.set(key, value);
+        }
+      });
 
       let cookiesToSet = [];
-      if (response.headers.has('set-cookie')) {
-        const setCookies = response.headers.getSetCookie();
-        setCookies.forEach(c => cookiesToSet.push(c.replace(/Domain=[^;]+;?\s*/ig, '')));
-        responseHeaders.delete('set-cookie');
+      if (typeof response.headers.getSetCookie === 'function') {
+        cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, ''));
+      }
+      const applyCookies = () => cookiesToSet.forEach(c => responseHeaders.append('set-cookie', c));
+
+      // Status không được phép có body
+      if ([101, 204, 205, 304].includes(response.status)) {
+        applyCookies();
+        return new Response(null, { status: response.status, headers: responseHeaders });
       }
 
-      const contentType = responseHeaders.get('content-type') || '';
+      // 2. XỬ LÝ CHUYỂN HƯỚNG
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (location) {
+          let locUrl;
+          try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
+
+          if (locUrl && locUrl.hostname.includes(baseDomain)) {
+            let newPath = locUrl.pathname + locUrl.search;
+
+            if (tenantPrefix && !newPath.startsWith(tenantPrefix)) {
+              if (/^\/(page|LMS|module|api|assets)\//i.test(locUrl.pathname)) {
+                newPath = tenantPrefix + newPath;
+              }
+            }
+
+            const reqPathname = url.pathname;
+            const locPathname = new URL(newPath, proxyDomain).pathname;
+
+            if (locUrl.hostname === targetHost && reqPathname === locPathname) {
+              return new Response('<html><body><h1>Đã chặn vòng lặp Redirect. Vui lòng tải lại trang (F5).</h1></body></html>', {
+                status: 200,
+                headers: { 'content-type': 'text/html; charset=utf-8' }
+              });
+            }
+
+            cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`);
+            applyCookies();
+            responseHeaders.set('location', proxyDomain + newPath);
+            return new Response(null, { status: response.status, headers: responseHeaders });
+          }
+
+          applyCookies();
+          responseHeaders.set('location', location);
+          return new Response(null, { status: response.status, headers: responseHeaders });
+        }
+      }
+
+      // 3. XỬ LÝ TEXT (HTML, JSON, JS, CSS)
+      const contentType = response.headers.get('content-type') || '';
       const isTextContent = contentType.includes('text/') ||
                             contentType.includes('application/json') ||
-                            contentType.includes('javascript');
+                            contentType.includes('javascript') ||
+                            contentType.includes('application/x-javascript');
 
       if (isTextContent) {
         let text = await response.text();
 
-        // Kiểm tra xem có bị F5 chặn không
+        // Bị F5 chặn thì gửi log về Discord
         if (text.includes("The requested URL was rejected") || response.status === 403) {
           const receivedHeadersLog = Object.fromEntries(response.headers.entries());
           ctx.waitUntil(sendDiscordLog(sentHeadersLog, response.status, receivedHeadersLog, text));
         }
 
         let foundTenant = null;
+
         const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexSub, (match, subdomain) => {
+        text = text.replace(regexSub, (m, subdomain) => {
           foundTenant = subdomain + '.' + baseDomain;
-          return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain;
+          return m.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain;
         });
 
         const regexRoot = new RegExp(`https:\\\\?/\\\\?/${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexRoot, match => {
-          return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain;
+        text = text.replace(regexRoot, m => {
+          return m.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain;
         });
 
         if (foundTenant && foundTenant !== targetHost) {
           cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`);
         }
-
-        cookiesToSet.forEach(c => responseHeaders.append('set-cookie', c));
+        applyCookies();
 
         if (contentType.includes('text/html')) {
           if (tenantPrefix) {
             const relativePathRegex = /(href|action|src)=(["'])(\/(?:page|LMS|module|api|assets)[^"']*)/gi;
-            text = text.replace(relativePathRegex, (match, attr, quote, path) => {
-              if (path.startsWith(tenantPrefix)) return match;
+            text = text.replace(relativePathRegex, (m, attr, quote, path) => {
+              if (path.startsWith(tenantPrefix)) return m;
               return `${attr}=${quote}${tenantPrefix}${path}`;
             });
           }
@@ -144,50 +173,39 @@ export default {
           text = text.replace(/<script[^>]*src=["'][^"']*(adsbygoogle|popunder|adzone|doubleclick|adsystem)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, '');
 
           const injectedScript = `
-            <script>
-              Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-              Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-              const blockVisibility = (e) => { e.stopImmediatePropagation(); e.stopPropagation(); };
-              window.addEventListener('visibilitychange', blockVisibility, true);
-              document.addEventListener('visibilitychange', blockVisibility, true);
+          <script>
+            Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+            const blockVisibility = (e) => { e.stopImmediatePropagation(); e.stopPropagation(); };
+            window.addEventListener('visibilitychange', blockVisibility, true);
+            document.addEventListener('visibilitychange', blockVisibility, true);
 
-              const originalWindowOpen = window.open;
-              window.open = function(url, name, specs) {
-                  if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) return null;
-                  return originalWindowOpen.apply(this, arguments);
-              };
-            </script>
-          `;
-          text = text.replace(/<head[^>]*>/i, match => match + injectedScript);
+            const originalWindowOpen = window.open;
+            window.open = function(url, name, specs) {
+                if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) return null;
+                return originalWindowOpen.apply(this, arguments);
+            };
+
+            const observer = new MutationObserver(mutations => {
+              mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                  if (node.tagName === 'SCRIPT' && node.src && /(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
+                      node.type = 'javascript/blocked'; node.remove();
+                  }
+                });
+              });
+            });
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+          </script>
+        `;
+          text = text.replace(/<head[^>]*>/i, m => m + injectedScript);
         }
 
         return new Response(text, { status: response.status, headers: responseHeaders });
       }
 
-      if (response.status >= 300 && response.status < 400) {
-        const location = responseHeaders.get('location');
-        if (location) {
-          let locUrl;
-          try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
-          if (locUrl && locUrl.hostname.includes(baseDomain)) {
-            let newPath = locUrl.pathname + locUrl.search;
-            if (tenantPrefix && !newPath.startsWith(tenantPrefix) && /^\/(page|LMS|module|api|assets)\//i.test(locUrl.pathname)) {
-              newPath = tenantPrefix + newPath;
-            }
-            if (locUrl.hostname === targetHost && url.pathname === new URL(newPath, proxyDomain).pathname) {
-              return new Response('Chặn lặp Redirect', { status: 200 });
-            }
-            cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`);
-            cookiesToSet.forEach(c => responseHeaders.append('set-cookie', c));
-            responseHeaders.set('location', proxyDomain + newPath);
-            return new Response(null, { status: response.status, headers: responseHeaders });
-          }
-          responseHeaders.set('location', location);
-          return new Response(null, { status: response.status, headers: responseHeaders });
-        }
-      }
-
-      cookiesToSet.forEach(c => responseHeaders.append('set-cookie', c));
+      // 4. FILE NHỊ PHÂN (ẢNH, VIDEO, TÀI LIỆU...) - STREAM THẲNG
+      applyCookies();
       return new Response(response.body, { status: response.status, headers: responseHeaders });
 
     } catch (error) {
