@@ -8,7 +8,7 @@ export default {
     }
 
     // 2. Đảm bảo đổi đúng sang hostname của máy chủ đích
-    const TARGET_HOST = "ten-mien-dich-cua-ban.vn"; // Thay bằng domain thật
+    const TARGET_HOST = "k12online.vn"; // Thay bằng domain thật
     const targetUrl = `https://${TARGET_HOST}${url.pathname}${url.search}`;
 
     // 3. Lọc bỏ các Cookie TS* của tường lửa F5 BIG-IP
